@@ -1,6 +1,10 @@
 import sys
-sys.path.append("/home/zhang/Project/HFR_Denoise")
+import time
+import os
+# Add the parent directory of 'pipeline' (which is HFR_Denoise) to the path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import numpy as np
 from model.denoise_model import DenoiseModel
 from utils.utils import *
 from utils.plot_utils import *
@@ -64,33 +68,67 @@ class DenoisePipeline:
         return out, mask
 
 
+def run_denoising(defender: DenoisePipeline, signals: np.ndarray) -> np.ndarray:
+    """
+    Denoises a batch of LiDAR signals.
+    """
+    clean_xs = []
+    total_inference_time = 0.0
+    num_frames = len(signals)
+
+    for i in range(num_frames):
+        print(f"Denoising signal {i + 1}/{num_frames}...")
+        x_np = signals[i]
+        x = torch.from_numpy(x_np).float().unsqueeze(0)
+        x = x.to(defender.device, non_blocking=True)
+
+        inference_start_time = time.time()
+        clean_x, _ = defender.denoise(x)
+        inference_end_time = time.time()
+        total_inference_time += (inference_end_time - inference_start_time)
+
+        clean_x_np = clean_x.squeeze(0).detach().cpu().numpy()
+        clean_xs.append(clean_x_np)
+    
+    if num_frames > 0:
+        avg_inference_time = total_inference_time / num_frames
+        print(f"Average inference time per frame: {avg_inference_time:.4f} seconds")
+
+    return np.array(clean_xs)
+
+
 if __name__ == "__main__":
-    defender = DenoisePipeline(ckpt_path="./run/0923_dn_dim32_lat_attn.pt")
+    import argparse
+    parser = argparse.ArgumentParser(description="Denoise LiDAR signals from an .npz file.")
+    parser.add_argument("--input-npz", type=str, required=True, help="Path to the input .npz file containing 'signals'.")
+    parser.add_argument("--output-npz", type=str, default="denoised_lidar_signals_batch.npz", help="Path to save the output .npz file.")
+    parser.add_argument("--ckpt-path", type=str, required=True, help="Path to the model checkpoint file.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames to process from the input file.")
 
-    # Prepare Data Here
-    signals, labels = load_data("/data2/yoshida/hist_matrix_test/lidar_signal.npz")
+    args = parser.parse_args()
 
-    x = signals[0]
-    x = torch.from_numpy(x).float().unsqueeze(0)
-    x = x.to(defender.device, non_blocking=True)
+    defender = DenoisePipeline(ckpt_path=args.ckpt_path)
 
-    clean_x, mask = defender.denoise(x)
-    clean_x = clean_x.squeeze(0).detach().cpu().numpy()
-    hfr_mask = mask.squeeze(0).detach().cpu().numpy().astype(np.bool_)
+    print("Loading Data...")
+    data = np.load(args.input_npz)
+    signals = data['signals']
+    offsets = data.get('initial_azimuth_offsets')
+    
+    if args.num_frames:
+        signals = signals[:args.num_frames]
+        if offsets is not None:
+            offsets = offsets[:args.num_frames]
 
-    # Visualization
-    gt_mask = (labels[0] == 2)
-    save_path = "./vis/Denoise_Vis.png"
-    orig_x_np = x.squeeze(0).detach().cpu().numpy()
+    print(f"Loaded {len(signals)} signals.")
 
-    save_3d_panels(
-        orig_data=orig_x_np,
-        denoised_data=clean_x,
-        gt_mask=gt_mask.astype(bool),
-        pred_mask=hfr_mask.astype(bool),
-        save_path=save_path,
-        scale=(1 / 10, 1 / 5, 3.0),
-        quantile=0.999,
-        max_points=None,
-        s=0.2
-    )
+    denoised_signals = run_denoising(defender, signals)
+
+    print(f"Saving {len(denoised_signals)} denoised signals to {args.output_npz}")
+    
+    save_payload = {'signals': denoised_signals}
+    if offsets is not None:
+        save_payload['initial_azimuth_offsets'] = offsets
+        
+    np.savez(args.output_npz, **save_payload)
+
+    print("Done.")

@@ -10,7 +10,8 @@ def load_data(npz_file_path):
     with np.load(npz_file_path) as data:
         hist_matrix = data['signals']          # (N, H, W, D)
         label_matrix = data.get('labels', [None])
-    return hist_matrix, label_matrix
+        offsets = data.get('initial_azimuth_offsets', None)
+    return hist_matrix, label_matrix, offsets
 
 
 # ====== Dataset Class ======

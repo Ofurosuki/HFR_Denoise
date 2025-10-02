@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
@@ -11,7 +12,7 @@ def save_3d_panels(orig_data: np.ndarray,
                    save_path: str,
                    scale=(1/10, 1/5, 3.0),
                    quantile: float = 0.999,
-                   max_points: int | None = None,
+                   max_points: Optional[int] = None,
                    s: float = 0.2):
 
     H, W, D = orig_data.shape
