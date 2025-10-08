@@ -76,8 +76,8 @@ def run_denoising(defender: DenoisePipeline, signals: np.ndarray) -> np.ndarray:
     total_inference_time = 0.0
     num_frames = len(signals)
 
-    for i in range(num_frames):
-        print(f"Denoising signal {i + 1}/{num_frames}...")
+    for i in tqdm(range(num_frames), desc="Denoising signals"):
+        #print(f"Denoising signal {i + 1}/{num_frames}...")
         x_np = signals[i]
         x = torch.from_numpy(x_np).float().unsqueeze(0)
         x = x.to(defender.device, non_blocking=True)
