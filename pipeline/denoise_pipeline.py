@@ -18,7 +18,7 @@ class DenoisePipeline:
       3) Mask out Input Data
     """
     def __init__(self, ckpt_path: str, device: str = None, strict: bool = True):
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = torch.device(device or ("cuda:1" if torch.cuda.is_available() else "cpu"))
 
         # Load Checkpoint
         ckpt = torch.load(ckpt_path, map_location=self.device)
@@ -99,36 +99,102 @@ def run_denoising(defender: DenoisePipeline, signals: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Denoise LiDAR signals from an .npz file.")
-    parser.add_argument("--input-npz", type=str, required=True, help="Path to the input .npz file containing 'signals'.")
-    parser.add_argument("--output-npz", type=str, default="denoised_lidar_signals_batch.npz", help="Path to save the output .npz file.")
+    import glob
+    import json
+    import blosc2
+    import shutil
+
+    parser = argparse.ArgumentParser(description="Denoise LiDAR signals from an .npz file or blosc2 directory.")
+    parser.add_argument("--input-path", type=str, required=True, help="Path to the input .npz file or directory containing blosc2 frames.")
+    parser.add_argument("--output-path", type=str, default="denoised_lidar_signals", help="Path to save the output .npz file or blosc2 directory.")
     parser.add_argument("--ckpt-path", type=str, required=True, help="Path to the model checkpoint file.")
-    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames to process from the input file.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames to process from the input.")
 
     args = parser.parse_args()
 
     defender = DenoisePipeline(ckpt_path=args.ckpt_path)
 
     print("Loading Data...")
-    data = np.load(args.input_npz)
-    signals = data['signals']
-    offsets = data.get('initial_azimuth_offsets')
-    
+    signals = []
+    offsets = []
+    frame_tokens = []
+    input_is_dir = False
+
+    if os.path.isfile(args.input_path) and args.input_path.endswith('.npz'):
+        data = np.load(args.input_path)
+        signals = data['signals']
+        offsets = data.get('initial_azimuth_offsets')
+    elif os.path.isdir(args.input_path):
+        input_is_dir = True
+        frame_dirs = sorted(glob.glob(os.path.join(args.input_path, '*')))
+        frame_dirs = [d for d in frame_dirs if os.path.isdir(d)]
+        
+        for frame_dir in tqdm(frame_dirs, desc="Loading frames"):
+            signal_path = os.path.join(frame_dir, 'signal.bl2')
+            config_path = os.path.join(frame_dir, 'config.json')
+            if os.path.exists(signal_path) and os.path.exists(config_path):
+                with open(signal_path, 'rb') as f:
+                    packed_signal = f.read()
+                signal_data = blosc2.unpack_array(packed_signal)
+                signals.append(signal_data)
+                
+                with open(config_path, 'r') as f:
+                    config_data = json.load(f)
+                offsets.append(config_data.get('initial_azimuth_offset'))
+                frame_tokens.append(os.path.basename(frame_dir))
+        
+        signals = np.array(signals)
+        if any(o is not None for o in offsets):
+            offsets = np.array(offsets)
+        else:
+            offsets = None
+    else:
+        raise ValueError("Invalid input path. Must be an .npz file or a directory.")
+
     if args.num_frames:
         signals = signals[:args.num_frames]
         if offsets is not None:
             offsets = offsets[:args.num_frames]
+        if frame_tokens:
+            frame_tokens = frame_tokens[:args.num_frames]
 
     print(f"Loaded {len(signals)} signals.")
 
     denoised_signals = run_denoising(defender, signals)
 
-    print(f"Saving {len(denoised_signals)} denoised signals to {args.output_npz}")
-    
-    save_payload = {'signals': denoised_signals}
-    if offsets is not None:
-        save_payload['initial_azimuth_offsets'] = offsets
-        
-    np.savez(args.output_npz, **save_payload)
+    print(f"Saving {len(denoised_signals)} denoised signals to {args.output_path}")
+
+    if args.output_path.endswith('.npz'):
+        save_payload = {'signals': denoised_signals}
+        if offsets is not None:
+            save_payload['initial_azimuth_offsets'] = offsets
+        np.savez(args.output_path, **save_payload)
+    else: # Save as blosc2 directory
+        os.makedirs(args.output_path, exist_ok=True)
+        if not frame_tokens:
+            frame_tokens = [f"frame_{i:06d}" for i in range(len(denoised_signals))]
+
+        for i, denoised_signal in enumerate(tqdm(denoised_signals, desc="Saving frames")):
+            token = frame_tokens[i]
+            frame_output_dir = os.path.join(args.output_path, token)
+            os.makedirs(frame_output_dir, exist_ok=True)
+
+            # Save denoised signal
+            with open(os.path.join(frame_output_dir, 'signal.bl2'), 'wb') as f:
+                f.write(blosc2.pack_array(denoised_signal))
+
+            # Copy other files from original directory if input was a directory
+            if input_is_dir:
+                input_frame_dir = os.path.join(args.input_path, token)
+                for filename in ['config.json', 'labels.bl2', 'answer_matrix.bl2']:
+                    src_file = os.path.join(input_frame_dir, filename)
+                    if os.path.exists(src_file):
+                        shutil.copy2(src_file, os.path.join(frame_output_dir, filename))
+            else: # Create a minimal config if input was .npz
+                config_data = {}
+                if offsets is not None and i < len(offsets):
+                    config_data['initial_azimuth_offset'] = float(offsets[i])
+                with open(os.path.join(frame_output_dir, 'config.json'), 'w') as f:
+                    json.dump(config_data, f, indent=2)
 
     print("Done.")
