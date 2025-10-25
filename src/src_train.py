@@ -6,6 +6,7 @@ import argparse
 from model.denoise_model import DenoiseModel
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from dataset.dataset import HistMatrixDataset
 from utils.utils import *
 
 
@@ -37,7 +38,8 @@ class DiceLoss(nn.Module):
 # ====== Main ======
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--npz", type=str, default="/data1/user/zhang/HFR/lidar_signal.npz", help="npz file directory.")
+    parser.add_argument("--data_root", type=str, default="/home/dataset/HFR_Denoise", help="HFR dataset root.")
+    parser.add_argument("--normalize_max", type=float, default=9.0, help="Per-sample max for normalization; set <=0 to disable.")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epoches.")
     parser.add_argument("--batch_size", type=int, default=1, help="Training batch size.")
     parser.add_argument("--lr", type=float, default=3e-4, help="Training learning rate.")
@@ -54,32 +56,26 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
-    # ======= Load Dataset =======
-    signals, labels = load_data(args.npz)
-    assert isinstance(labels, np.ndarray), "labels does not exist."
-    N, H, W, D = signals.shape
-    print(f"Loaded signals: {signals.shape}, labels: {labels.shape}, dtype={signals.dtype}/{labels.dtype}")
+    # ======= Datasets =======
+    train_set = HistMatrixDataset(
+        root_path=args.data_root,
+        split="train",
+        dataset_name="nuscenes",
+        scan_type="horizontal",
+        sync_angle=1,
+        transform=None,
+    )
+    val_set = HistMatrixDataset(
+        root_path=args.data_root,
+        split="val",
+        dataset_name="nuscenes",
+        scan_type="horizontal",
+        sync_angle=1,
+        transform=None,
+    )
 
-    # Normalize signals to [0, 1] using maximum value = 9.
-    scale = float(np.max(signals).astype(np.float32))
-    if not np.isfinite(scale) or scale <= 0:
-        scale = 9.0
-
-    dataset = LidarHFRDataset(signals, labels, scale=scale)
-
-    # ======= Train versus Val = 8:2 =======
-    rng = np.random.RandomState(42)
-    indices = np.arange(N)
-    rng.shuffle(indices)
-    split = int(N * 0.8 + 1e-6)
-    train_idx = indices[:split]
-    val_idx = indices[split:]
-
-    train_set = Subset(dataset, train_idx.tolist())
-    val_set = Subset(dataset, val_idx.tolist())
-    print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
-
-    # DataLoader
+    # ======= DataLoader =======
+    collate = make_collate_fn(args.normalize_max)
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -88,6 +84,7 @@ def main():
         pin_memory=True,
         persistent_workers=args.workers > 0,
         drop_last=False,
+        collate_fn=collate,
     )
     val_loader = DataLoader(
         val_set,
@@ -97,7 +94,9 @@ def main():
         pin_memory=True,
         persistent_workers=args.workers > 0,
         drop_last=False,
+        collate_fn=collate,
     )
+    print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
 
     # ======= Model & Optimizer & Loss =======
     model = DenoiseModel(
@@ -145,7 +144,7 @@ def main():
                 "epoch": epoch,
                 "best_score": best_score,
                 "args": vars(args),
-                "scale": scale,
+                "normalize_max": args.normalize_max,
             }, best_path)
             print(f"Saved best to: {best_path} (mean IoU={best_score:.4f})")
 

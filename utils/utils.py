@@ -1,53 +1,26 @@
 import numpy as np
-from typing import Tuple, Dict
+from typing import Dict
 from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
 
 
-# ====== Load npz data ======
-def load_data(npz_file_path):
-    with np.load(npz_file_path) as data:
-        hist_matrix = data['signals']          # (N, H, W, D)
-        label_matrix = data.get('labels', [None])
-        offsets = data.get('initial_azimuth_offsets', None)
-    return hist_matrix, label_matrix, offsets
-
-
-# ====== Dataset Class ======
-class LidarHFRDataset(Dataset):
-    """
-    signals: (N, H, W, D) numpy.ndarray
-    labels:  (N, H, W, D) numpy.ndarray, uint8, {0, 1, 2} = {BG, Object, Attack}
-    Normalize: x / scale
-    """
-    def __init__(self, signals: np.ndarray, labels: np.ndarray, scale: float = 9.0):
-        assert signals.ndim == 4, f"signals shape should be (N,H,W,D), got {signals.shape}"
-        self.signals = signals
-        self.labels = labels
-        self.scale = float(scale)
-
-        # Label Self-check
-        if self.labels is not None:
-            assert self.labels.shape == self.signals.shape, f"labels shape {self.labels.shape} != signals {self.signals.shape}"
-            assert self.labels.dtype in (np.uint8, np.int16, np.int32, np.int64)
-
-    def __len__(self):
-        return self.signals.shape[0]
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.signals[idx]  # (H,W,D)
-        x = (x.astype(np.float32) / self.scale)
-
-        # Transform to torch.tensor
-        x = torch.from_numpy(x)  # (H,W,D), float32
-
-        if self.labels is None or isinstance(self.labels, list) and self.labels[0] is None:
-            y = torch.full_like(x, fill_value=0, dtype=torch.long)  # Avoid label mistakes
-        else:
-            y = torch.from_numpy(self.labels[idx].astype(np.int64))  # (H,W,D), long
-
-        return x, y
+# ====== Collate FN ======
+def make_collate_fn(normalize_max: float):
+    def collate_fn(batch):
+        signals = []
+        labels = []
+        for sample in batch:
+            sig = sample["signal"].float()
+            lab = sample["labels"].long()
+            if normalize_max is not None and normalize_max > 0:
+                sig = sig / float(normalize_max)
+            signals.append(sig)
+            labels.append(lab)
+        signals = torch.stack(signals, dim=0)
+        labels = torch.stack(labels, dim=0)
+        return signals, labels
+    return collate_fn
 
 
 # ====== IoU Calculation ======

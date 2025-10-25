@@ -182,6 +182,23 @@ class AxialSelfAttentionW(nn.Module):
         return x + out  # residual
 
 
+class AxialSelfAttentionH(nn.Module):
+    def __init__(self, ch: int, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
+        self.mha = nn.MultiheadAttention(ch, num_heads=num_heads, dropout=dropout, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W, D)
+        B, C, H, W, D = x.shape
+        y = self.norm(x)
+        # merge (B, W, D) as batch; sequence = H; feature = C
+        y = y.permute(0, 3, 4, 2, 1).contiguous().view(B * W * D, H, C)  # (N, S = H, C)
+        out, _ = self.mha(y, y, y, need_weights=False)
+        out = out.view(B, W, D, H, C).permute(0, 4, 3, 1, 2).contiguous()  # (B, C, H, W, D)
+        return x + out  # residual
+
+
 class AxialSelfAttentionD(nn.Module):
     def __init__(self, ch: int, num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
@@ -253,6 +270,7 @@ class DenoiseModel(nn.Module):
         self.use_axial_attn = use_axial_attn
         if use_axial_attn:
             self.ax_w = AxialSelfAttentionW(8 * C, num_heads=8)
+            self.ax_h = AxialSelfAttentionH(8 * C, num_heads=8)
             self.ax_d = AxialSelfAttentionD(8 * C, num_heads=8)
 
         # Decoder (upsample + concat skip + light blocks)
@@ -308,6 +326,7 @@ class DenoiseModel(nn.Module):
 
         if self.use_axial_attn:
             b = self.ax_w(b)
+            b = self.ax_h(b)
             b = self.ax_d(b)
 
         # Decoder
@@ -334,9 +353,13 @@ class DenoiseModel(nn.Module):
 # Test Bench
 # -----------------------------
 if __name__ == "__main__":
-    B, H, W, D = 4, 32, 1800, 800
+    import time
+    B, H, W, D = 1, 32, 1800, 800
     x = torch.randn(B, H, W, D).to('cuda')
-    model = DenoiseModel(in_channels=1, num_classes=3, hidden_dim=32, use_axial_attn=False).to('cuda')
+    model = DenoiseModel(in_channels=1, num_classes=3, hidden_dim=32, use_axial_attn=True).to('cuda')
     with torch.no_grad():
+        st = time.time()
         y = model(x)
+        ed = time.time()
+        print('Frame process time: {}'.format(ed - st))
     print(y)
