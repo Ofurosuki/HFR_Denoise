@@ -2,3 +2,5 @@ __pycache__/
 venv/** 
 *.pt
 *.png
+data_sony/*
+processed_data_sony/*

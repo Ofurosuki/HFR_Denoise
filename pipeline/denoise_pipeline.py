@@ -17,8 +17,9 @@ class DenoisePipeline:
       2) Predict HFR Mask
       3) Mask out Input Data
     """
-    def __init__(self, ckpt_path: str, device: str = None, strict: bool = True):
+    def __init__(self, ckpt_path: str, device: str = None, strict: bool = True, mask_expansion: int = 0):
         self.device = torch.device(device or ("cuda:1" if torch.cuda.is_available() else "cpu"))
+        self.mask_expansion = mask_expansion
 
         # Load Checkpoint
         ckpt = torch.load(ckpt_path, map_location=self.device)
@@ -44,6 +45,29 @@ class DenoisePipeline:
         else:
             self.scale = 9.0
 
+    @staticmethod
+    def expand_mask(mask: torch.Tensor, expansion_size: int) -> torch.Tensor:
+        if expansion_size <= 0:
+            return mask
+
+        original_shape = mask.shape
+        sequence_length = original_shape[-1]
+
+        reshaped_mask = mask.view(-1, 1, sequence_length).float()
+
+        kernel_size = 2 * expansion_size + 1
+        padding = expansion_size
+
+        dilated_reshaped_mask = torch.nn.functional.max_pool1d(
+            reshaped_mask,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding
+        )
+
+        dilated_mask = dilated_reshaped_mask.view(original_shape).bool()
+        return dilated_mask
+
     @torch.no_grad()
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
         logits = self.model(x)
@@ -54,6 +78,8 @@ class DenoisePipeline:
         logits = self.forward_logits(x)
         pred_cls = logits.argmax(dim=1)
         mask = (pred_cls == self.attack_cls)
+        if self.mask_expansion > 0:
+            mask = self.expand_mask(mask, self.mask_expansion)
         return mask
 
     @torch.no_grad()
@@ -106,13 +132,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Denoise LiDAR signals from an .npz file or blosc2 directory.")
     parser.add_argument("--input-path", type=str, required=True, help="Path to the input .npz file or directory containing blosc2 frames.")
-    parser.add_argument("--output-path", type=str, default="denoised_lidar_signals", help="Path to save the output .npz file or blosc2 directory.")
+    parser.add_argument('--output-path', type=str, default="denoised_lidar_signals", help="Path to save the output .npz file or blosc2 directory.")
     parser.add_argument("--ckpt-path", type=str, required=True, help="Path to the model checkpoint file.")
     parser.add_argument("--num-frames", type=int, default=None, help="Number of frames to process from the input.")
+    parser.add_argument("--mask-expansion", type=int, default=0, help="Number of samples to expand the mask by on each side.")
 
     args = parser.parse_args()
 
-    defender = DenoisePipeline(ckpt_path=args.ckpt_path)
+    defender = DenoisePipeline(ckpt_path=args.ckpt_path, mask_expansion=args.mask_expansion)
 
     print("Loading Data...")
     signals = []
