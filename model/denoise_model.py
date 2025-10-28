@@ -284,6 +284,43 @@ class DenoiseModel(nn.Module):
         self.head_up = nn.Upsample(scale_factor=(1, 5, 8), mode="trilinear", align_corners=False)
         self.head = Conv3dCircularW(C, num_classes, kernel_size=(1, 1, 1), stride=(1, 1, 1), bias=True)
 
+    def _match_size(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Adjust x to match target's spatial dimensions (H, W, D) using cropping or padding.
+        x, target: (B, C, H, W, D)
+        """
+        if x.shape[2:] == target.shape[2:]:
+            return x
+
+        # Compare dimensions
+        dh = target.shape[2] - x.shape[2]
+        dw = target.shape[3] - x.shape[3]
+        dd = target.shape[4] - x.shape[4]
+
+        # Pad or crop H dimension
+        if dh > 0:
+            x = F.pad(x, (0, 0, 0, 0, 0, dh))
+        elif dh < 0:
+            x = x[:, :, :target.shape[2], :, :]
+
+        # Pad or crop W dimension (circular)
+        if dw > 0:
+            pad_left = dw // 2
+            pad_right = dw - pad_left
+            x = circular_pad_w(x, (pad_left, pad_right))
+        elif dw < 0:
+            crop = -dw
+            crop_left = crop // 2
+            x = x[:, :, :, crop_left:crop_left + target.shape[3], :]
+
+        # Pad or crop D dimension
+        if dd > 0:
+            x = F.pad(x, (0, dd, 0, 0, 0, 0))
+        elif dd < 0:
+            x = x[:, :, :, :, :target.shape[4]]
+
+        return x
+
     def forward(self, x):
         """
         Input: (B, H, W, D)
@@ -312,14 +349,18 @@ class DenoiseModel(nn.Module):
 
         # Decoder
         u3 = self.up3(b)  # (B, 8C, H, 90, 25)
+        # Adjust spatial dimensions if needed
+        u3 = self._match_size(u3, e2)
         u3 = torch.cat([u3, e2], dim=1)  # (B, 8C+4C, H, 90, 25)
         u3 = self.dec3(u3)  # (B, 4C, H, 90, 25)
 
         u2 = self.up2(u3)  # (B, 4C, H, 180, 50)
+        u2 = self._match_size(u2, e1)
         u2 = torch.cat([u2, e1], dim=1)  # (B, 4C+2C, H, 180, 50)
         u2 = self.dec2(u2)  # (B, 2C, H, 180, 50)
 
         u1 = self.up1(u2)  # (B, 2C, H, 360, 100)
+        u1 = self._match_size(u1, e0)
         u1 = torch.cat([u1, e0], dim=1)  # (B, 2C+C, H, 360, 100)
         u1 = self.dec1(u1)  # (B, C, H, 360, 100)
 
