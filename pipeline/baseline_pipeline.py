@@ -5,23 +5,24 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import numpy as np
-from model.denoise_model import DenoiseModel
+from model.baseline_model import DAxisConvBaseline
 from utils.utils import *
 # from utils.plot_utils import *
 
 
-class DenoisePipeline:
+class BaselinePipeline:
     """
-    HFR Denoising Pipeline:
-      1) Load DenoiseModel
+    HFR Denoising Pipeline using D-Axis Baseline Model:
+      1) Load DAxisConvBaseline
       2) Predict HFR Mask
       3) Mask out Input Data
     """
-    def __init__(self, ckpt_path: str, device: str = None, strict: bool = True, mask_expansion: int = 0, hidden_dim: int = None, use_axial_attn = None, split_h: int = None, use_fp16: bool = False):
-        self.device = torch.device(device or ("cuda:1" if torch.cuda.is_available() else "cpu"))
+    def __init__(self, ckpt_path: str, device: str = None, strict: bool = True, mask_expansion: int = 0, hidden_dim: int = None, use_d_attn = None, split_h: int = None, use_fp16: bool = False, spatial_chunk_size: int = None):
+        self.device = torch.device(device or ("cuda:2" if torch.cuda.is_available() else "cpu"))
         self.mask_expansion = mask_expansion
         self.split_h = split_h  # Number of chunks to split H dimension
         self.use_fp16 = use_fp16  # Use float16 for inference
+        self.spatial_chunk_size = spatial_chunk_size  # Chunk size for H*W spatial dimension (e.g., 4096)
 
         # Load Checkpoint
         ckpt = torch.load(ckpt_path, map_location=self.device)
@@ -29,16 +30,16 @@ class DenoisePipeline:
         # Use provided hidden_dim, otherwise try checkpoint, otherwise default to 32
         if hidden_dim is None:
             hidden_dim = ckpt_args.get("hidden_dim", 32)
-        # Use provided use_axial_attn, otherwise try checkpoint, otherwise default to "whd"
-        if use_axial_attn is None:
-            use_axial_attn = ckpt_args.get("use_axial_attn", "whd")
+        # Use provided use_d_attn, otherwise try checkpoint, otherwise default to True
+        if use_d_attn is None:
+            use_d_attn = ckpt_args.get("use_d_attn", True)
 
         # Initialize Model and Load State
-        self.model = DenoiseModel(
+        self.model = DAxisConvBaseline(
             in_channels=1,
             num_classes=3,
             hidden_dim=hidden_dim,
-            use_axial_attn=use_axial_attn,
+            use_d_attn=use_d_attn,
         ).to(self.device)
         self.model.load_state_dict(ckpt["model"], strict=strict)
         self.model.eval()
@@ -82,6 +83,11 @@ class DenoisePipeline:
 
     @torch.no_grad()
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with optional spatial chunking to reduce GPU memory usage.
+        x: (B, H, W, D)
+        return: (B, C, H, W, D)
+        """
         # DEBUG: Print input shape
         print(f"[DEBUG] forward_logits input shape: {x.shape}, ndim={x.ndim}")
 
@@ -89,33 +95,46 @@ class DenoisePipeline:
         if x.ndim != 4:
             raise ValueError(f"Expected 4D input (B, H, W, D), got {x.ndim}D with shape {x.shape}")
 
+        B, H, W, D = x.shape
+
         # Convert to fp16 if enabled
         if self.use_fp16:
             x = x.half()
 
-        # If split_h is specified, process H dimension in chunks
-        if self.split_h is not None and self.split_h > 1:
-            B, H, W, D = x.shape  # 4D input: (B, H, W, D)
-            chunk_size = (H + self.split_h - 1) // self.split_h  # Ceiling division
+        # If spatial_chunk_size is specified, process H*W in chunks (similar to baseline_train.py)
+        if self.spatial_chunk_size is not None and self.spatial_chunk_size > 0:
+            N = B * H * W
+            x_flat = x.reshape(N, D)  # (N, D)
 
-            print(f"[DEBUG] Splitting H={H} into {self.split_h} chunks of size {chunk_size}")
+            print(f"[DEBUG] Spatial chunking: N={N} (B={B}, H={H}, W={W}), chunk_size={self.spatial_chunk_size}")
 
-            logits_chunks = []
-            for chunk_idx, i in enumerate(range(0, H, chunk_size)):
-                end_i = min(i + chunk_size, H)
-                x_chunk = x[:, i:end_i, :, :]  # Slice H dimension (4D: B, H, W, D)
-                print(f"[DEBUG] Processing chunk {chunk_idx}: shape={x_chunk.shape}")
+            out_chunks = []
+            for s in range(0, N, self.spatial_chunk_size):
+                e = min(s + self.spatial_chunk_size, N)
+                xs = x_flat[s:e].unsqueeze(1).unsqueeze(1)  # (n, 1, 1, D)
 
-                logits_chunk = self.model(x_chunk)
-                logits_chunks.append(logits_chunk.float())  # Convert back to fp32
+                if s == 0:  # Only print for first chunk
+                    print(f"[DEBUG] Processing spatial chunk [0:{e}], shape={xs.shape}")
+
+                logits_chunk = self.model(xs)  # (n, C, 1, 1, D)
+                logits_chunk = logits_chunk.squeeze(2).squeeze(2)  # (n, C, D)
+
+                if self.use_fp16:
+                    logits_chunk = logits_chunk.float()  # Convert back to fp32
+
+                out_chunks.append(logits_chunk)
 
                 # Free GPU memory
-                del logits_chunk
+                del xs, logits_chunk
                 torch.cuda.empty_cache()
 
-            logits = torch.cat(logits_chunks, dim=2)  # Concatenate along H dimension (dim=2 in 5D output)
+            logits_flat = torch.cat(out_chunks, dim=0)  # (N, C, D)
+            C = logits_flat.shape[1]
+            logits = logits_flat.view(B, H, W, C, D).permute(0, 3, 1, 2, 4).contiguous()  # (B, C, H, W, D)
+
             print(f"[DEBUG] Concatenated logits shape: {logits.shape}")
         else:
+            # Original full-batch processing
             logits = self.model(x)
             if self.use_fp16:
                 logits = logits.float()  # Convert back to fp32
@@ -143,12 +162,12 @@ class DenoisePipeline:
         return out, mask
 
 
-def run_denoising(defender: DenoisePipeline, signals: np.ndarray, output_callback=None) -> np.ndarray:
+def run_denoising(defender: BaselinePipeline, signals: np.ndarray, output_callback=None) -> np.ndarray:
     """
     Denoises a batch of LiDAR signals.
 
     Args:
-        defender: DenoisePipeline instance
+        defender: BaselinePipeline instance
         signals: Input signals array
         output_callback: Optional callback(idx, denoised_signal) to process each frame immediately
                         to reduce memory usage
@@ -199,30 +218,35 @@ if __name__ == "__main__":
     import blosc2
     import shutil
 
-    parser = argparse.ArgumentParser(description="Denoise LiDAR signals from an .npz file or blosc2 directory.")
+    parser = argparse.ArgumentParser(description="Denoise LiDAR signals from an .npz file or blosc2 directory using D-Axis Baseline Model.")
     parser.add_argument("--input-path", type=str, required=True, help="Path to the input .npz file or directory containing blosc2 frames.")
     parser.add_argument('--output-path', type=str, default="denoised_lidar_signals", help="Path to save the output .npz file or blosc2 directory.")
     parser.add_argument("--ckpt-path", type=str, required=True, help="Path to the model checkpoint file.")
     parser.add_argument("--num-frames", type=int, default=None, help="Number of frames to process from the input.")
     parser.add_argument("--mask-expansion", type=int, default=0, help="Number of samples to expand the mask by on each side.")
     parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension of the model. If not specified, will try to read from checkpoint (default: 32).")
-    parser.add_argument("--use-axial-attn", type=str, default='whd', help="Axial attention config: 'whd' (all), 'w' (W only), 'h' (H only), 'd' (D only), 'wh', 'wd', 'hd', 'none'. If not specified, will read from checkpoint (default: 'whd').")
+    parser.add_argument("--use-d-attn", action="store_true", help="Use D-axis attention in the model. If not specified, will read from checkpoint (default: True).")
     parser.add_argument("--chunk-size", type=int, default=None, help="Process frames in chunks to reduce memory usage (blosc2 output only). Default: process all at once.")
-    parser.add_argument("--split-h", type=int, default=None, help="Split H dimension into N chunks to reduce GPU memory usage (e.g., 2 for 64→32+32). Recommended for 64-line LiDAR.")
+    parser.add_argument("--spatial-chunk-size", type=int, default=None, help="Spatial chunk size (H*W) for GPU memory efficiency (e.g., 4096). Similar to training chunk_size.")
+    parser.add_argument("--split-h", type=int, default=None, help="[Deprecated] Split H dimension into N chunks to reduce GPU memory usage. Use --spatial-chunk-size instead.")
     parser.add_argument("--fp16", action="store_true", help="Use float16 precision for inference to reduce GPU memory usage.")
 
     args = parser.parse_args()
 
-    defender = DenoisePipeline(
+    defender = BaselinePipeline(
         ckpt_path=args.ckpt_path,
         mask_expansion=args.mask_expansion,
         hidden_dim=args.hidden_dim,
-        use_axial_attn=args.use_axial_attn,
+        use_d_attn=args.use_d_attn,
         split_h=args.split_h,
-        use_fp16=args.fp16
+        use_fp16=args.fp16,
+        spatial_chunk_size=args.spatial_chunk_size
     )
 
+    if args.spatial_chunk_size:
+        print(f"GPU memory optimization: Spatial chunking enabled with chunk_size={args.spatial_chunk_size}")
     if args.split_h:
+        print(f"[Warning] --split-h is deprecated. Consider using --spatial-chunk-size instead.")
         print(f"GPU memory optimization: H dimension will be split into {args.split_h} chunks")
     if args.fp16:
         print(f"GPU memory optimization: Using float16 precision")
@@ -270,7 +294,6 @@ if __name__ == "__main__":
                         config_data = json.load(f)
                     offsets.append(config_data.get('initial_azimuth_offset'))
                     frame_tokens.append(os.path.basename(frame_dir))
-                
 
             signals = np.array(signals)
             if any(o is not None for o in offsets):

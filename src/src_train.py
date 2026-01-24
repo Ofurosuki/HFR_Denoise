@@ -38,7 +38,7 @@ class DiceLoss(nn.Module):
 # ====== Main ======
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, default="/home/dataset/HFR_Denoise", help="HFR dataset root.")
+    parser.add_argument("--data_root", type=str, default="/home/yoshida/dataset_spaal", help="HFR dataset root.")
     parser.add_argument("--normalize_max", type=float, default=9.0, help="Per-sample max for normalization; set <=0 to disable.")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epoches.")
     parser.add_argument("--batch_size", type=int, default=1, help="Training batch size.")
@@ -62,7 +62,7 @@ def main():
         split="train",
         dataset_name="nuscenes",
         scan_type="horizontal",
-        sync_angle=1,
+        sync_angle=0,
         transform=None,
     )
     val_set = HistMatrixDataset(

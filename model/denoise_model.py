@@ -89,8 +89,17 @@ class Conv3dCircularW(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W, D)
+        # DEBUG: Print shapes at each step
+        input_shape = x.shape
         x = circular_pad_w(x, self.pad_w)
+        after_circular = x.shape
         x = pad_h_d(x, self.pad_h, self.pad_d)
+        after_pad = x.shape
+
+        if x.ndim != 5:
+            print(f"[ERROR] Conv3dCircularW: Input was {input_shape}, after circular_pad_w: {after_circular}, after pad_h_d: {after_pad} (ndim={x.ndim})")
+            raise ValueError(f"Expected 5D tensor but got {x.ndim}D with shape {x.shape}")
+
         x = self.conv(x)
         return x
 
@@ -224,14 +233,16 @@ class DenoiseModel(nn.Module):
     Input: (B, H, W, D)
     Output: (B, 3, H, W, D)
     hidden_dim: Base hidden dimension
-    use_axial_attn: use W/D axial attention
+    use_axial_attn: axial attention configuration
+        - bool (backward compatibility): True = "whd", False = "none"
+        - str: "whd" (all), "w" (W only), "h" (H only), "d" (D only), "wh", "wd", "hd", "none"
     """
     def __init__(
         self,
         in_channels: int = 1,
         num_classes: int = 3,
         hidden_dim: int = 32,
-        use_axial_attn: bool = False,
+        use_axial_attn = False,  # bool or str
     ):
         super().__init__()
         C = hidden_dim
@@ -267,10 +278,23 @@ class DenoiseModel(nn.Module):
             DWSeparable3DBlock(8 * C, 8 * C, kernel_size=(3, 3, 5)),
         )
 
-        self.use_axial_attn = use_axial_attn
-        if use_axial_attn:
+        # Parse attention configuration
+        if isinstance(use_axial_attn, bool):
+            # Backward compatibility
+            attn_config = "whd" if use_axial_attn else "none"
+        else:
+            attn_config = str(use_axial_attn).lower()
+
+        self.attn_config = attn_config
+        self.use_attn_w = 'w' in attn_config
+        self.use_attn_h = 'h' in attn_config
+        self.use_attn_d = 'd' in attn_config
+
+        if self.use_attn_w:
             self.ax_w = AxialSelfAttentionW(8 * C, num_heads=8)
+        if self.use_attn_h:
             self.ax_h = AxialSelfAttentionH(8 * C, num_heads=8)
+        if self.use_attn_d:
             self.ax_d = AxialSelfAttentionD(8 * C, num_heads=8)
 
         # Decoder (upsample + concat skip + light blocks)
@@ -324,9 +348,11 @@ class DenoiseModel(nn.Module):
 
         b = self.bottleneck(d3)  # (B, 8C, H, 45, 25)
 
-        if self.use_axial_attn:
+        if self.use_attn_w:
             b = self.ax_w(b)
+        if self.use_attn_h:
             b = self.ax_h(b)
+        if self.use_attn_d:
             b = self.ax_d(b)
 
         # Decoder
